@@ -125,9 +125,8 @@ class SS2DFSCIL(nn.Module):
         
         # SS2D 프로세서로 직접 처리
         output = self.processor(x)  # [B, dim]
-        aux_loss = None  # aux_loss 완전 제거
         
-        return output, aux_loss
+        return output
 
 
 @NECKS.register_module()
@@ -292,7 +291,7 @@ class SS2DNeck(BaseModule):
         
         x_spatial = x_proj.view(B, H, W, -1)  # [B, H, W, out_channels]
 
-        ss2d_output, aux_loss = self.ss2d_fscil(x_spatial)
+        ss2d_output = self.ss2d_fscil(x_spatial)
 
         final_output = ss2d_output
 
@@ -359,7 +358,6 @@ class SS2DNeck(BaseModule):
         # Prepare outputs
         outputs.update({
             'out': final_output,
-            'aux_loss': aux_loss,
             'main': ss2d_output,
         })
 
