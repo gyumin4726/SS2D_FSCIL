@@ -21,7 +21,10 @@ class MultiScaleAdapter(BaseModule):
                  out_channels=512,
                  feat_size=7,
                  num_layers=2,
-                 mid_channels=None):
+                 mid_channels=None,
+                 d_state=256,
+                 dt_rank=256,
+                 ssm_expand_ratio=1.0):
         super(MultiScaleAdapter, self).__init__(init_cfg=None)
         
         self.in_channels = in_channels
@@ -29,11 +32,36 @@ class MultiScaleAdapter(BaseModule):
         self.feat_size = feat_size
         self.num_layers = num_layers
         self.mid_channels = in_channels * 2 if mid_channels is None else mid_channels
+        
         # 1. SS2D와 동일한 크기로 맞춤
         self.spatial_adapter = nn.AdaptiveAvgPool2d((feat_size, feat_size))
         
-        # 2. 간단한 MLP 프로젝션
-        self.mlp_proj = self._build_mlp(in_channels, out_channels, self.mid_channels, num_layers, feat_size)
+        # 2. 간단한 MLP 프로젝션 (채널 통일을 위한 사전 처리)
+        self.mlp_proj = self._build_mlp(in_channels, in_channels, self.mid_channels, num_layers, feat_size)
+        
+        # 3. 각 layer별 전용 SS2D (ssm_expand_ratio로 채널 확장)
+        directions = ('h', 'h_flip', 'v', 'v_flip')
+        self.layer_ss2d = SS2D(
+            in_channels,
+            ssm_ratio=ssm_expand_ratio,
+            d_state=d_state,
+            dt_rank=dt_rank,
+            directions=directions,
+            use_out_proj=False,
+            use_out_norm=True
+        )
+        
+        # 4. SS2D 출력 채널 계산
+        self.expanded_channels = int(in_channels * ssm_expand_ratio)
+        
+        # 5. expand ratio로 직접 out_channels에 맞춤 (Linear projection 불필요)
+        # self.channel_proj는 제거 - SS2D에서 바로 out_channels로 출력
+        
+        # 6. Positional embedding (4차원으로 효율적 구현)
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, feat_size, feat_size, in_channels)
+        )
+        trunc_normal_(self.pos_embed, std=.02)
         
     def _build_mlp(self, in_channels, out_channels, mid_channels, num_layers, feat_size):
         """Build MLP projection layers."""
@@ -53,13 +81,27 @@ class MultiScaleAdapter(BaseModule):
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # Step 1: 공간 크기 통일
-        x = self.spatial_adapter(x)  # (B, C, feat_size, feat_size)
+        # 1. Spatial 크기를 맞춤
+        x = self.spatial_adapter(x)  # (B, in_channels, feat_size, feat_size)
         
-        # Step 2: MLP 프로젝션
-        x = self.mlp_proj(x)         # (B, out_channels, feat_size, feat_size)
+        # 2. MLP 프로젝션 적용 (채널 정제)
+        x = self.mlp_proj(x)  # (B, in_channels, feat_size, feat_size)
         
-        return x  # (B, out_channels, feat_size, feat_size) - 공간 정보 유지
+        # 3. SS2D 처리를 위한 형태 변환 + Positional embedding (효율적 구현)
+        x = x.permute(0, 2, 3, 1)  # (B, feat_size, feat_size, in_channels)
+        x = x + self.pos_embed     # (B, feat_size, feat_size, in_channels) - 바로 더하기!
+        
+        # 4. LayerNorm → SS2D (VMamba VSSBlock 순서와 동일)
+        x = F.layer_norm(x, [self.in_channels])  # LayerNorm 먼저
+        x, _ = self.layer_ss2d(x)  # (B, feat_size, feat_size, expanded_channels)
+        
+        # 5. 공간 차원을 벡터로 변환 (VMamba 공식 구현과 동일)
+        x = x.permute(0, 3, 1, 2)  # (B, expanded_channels, feat_size, feat_size)
+        x = F.adaptive_avg_pool2d(x, 1)  # (B, expanded_channels, 1, 1)
+        x = x.flatten(1)  # (B, expanded_channels)
+        
+        # 6. SS2D에서 바로 out_channels로 출력됨 (expand ratio로 맞춤)
+        return x  # (B, out_channels)
 
 
 class SS2DProcessor(nn.Module):
@@ -85,19 +127,21 @@ class SS2DProcessor(nn.Module):
         )
 
         # SS2D 출력 차원은 ssm_expand_ratio에 의해 변경됨
-        expanded_dim = int(dim * ssm_expand_ratio)
-        self.norm = nn.LayerNorm(expanded_dim)
+        self.expanded_dim = int(dim * ssm_expand_ratio)
+        self.norm = nn.LayerNorm(self.expanded_dim)
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         
     def forward(self, x):
         B, H, W, dim = x.shape
 
-        x_processed, _ = self.ss2d_block(x)  # [B, H, W, dim]
-
-        x_processed = x_processed.permute(0, 3, 1, 2)  # [B, dim, H, W]
-        x_processed = self.avg_pool(x_processed).view(B, -1)  # [B, dim]
-
-        output = self.norm(x_processed)
+        # VMamba VSSBlock 순서: LayerNorm → SS2D
+        x = F.layer_norm(x, [dim])  # LayerNorm 먼저
+        x_processed, _ = self.ss2d_block(x)  # [B, H, W, expanded_dim]
+        
+        # VMamba 공식 classifier 순서: Permute → AvgPool → Flatten
+        x_processed = x_processed.permute(0, 3, 1, 2)  # [B, expanded_dim, H, W]
+        x_processed = self.avg_pool(x_processed)  # [B, expanded_dim, 1, 1]
+        output = x_processed.flatten(1)  # [B, expanded_dim]
         
         return output
 
@@ -175,7 +219,11 @@ class SS2DNeck(BaseModule):
         if self.use_multi_scale_skip:
             self.logger.info(f"Enhanced SS2D with Multi-Scale Skip Connections: {len(self.multi_scale_channels)} layers")
             self.logger.info(f"Multi-Scale Adapters: {self.multi_scale_channels} → {out_channels} channels")
-            self.logger.info(f"Shared SS2D for skip connection processing after weighted combination")
+            self.logger.info(f"Each layer uses dedicated SS2D with calculated expand ratios:")
+            for ch in self.multi_scale_channels:
+                ratio = out_channels / ch
+                self.logger.info(f"  Layer {ch}ch: expand_ratio={ratio:.1f} → {out_channels}ch")
+            self.logger.info(f"No shared SS2D - each layer processes independently")
         
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
 
@@ -184,33 +232,28 @@ class SS2DNeck(BaseModule):
         )
 
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, feat_size * feat_size, out_channels)
+            torch.zeros(1, feat_size, feat_size, out_channels)
         )
         trunc_normal_(self.pos_embed, std=.02)
 
         if self.use_multi_scale_skip:
             self.multi_scale_adapters = nn.ModuleList()
             for ch in self.multi_scale_channels:
+                # expand ratio를 계산해서 바로 out_channels(1024)로 맞춤
+                layer_expand_ratio = out_channels / ch  # 128→8.0, 256→4.0, 512→2.0
 
                 adapter = MultiScaleAdapter(
                     in_channels=ch,
                     out_channels=out_channels,
                     feat_size=self.feat_size,
                     num_layers=self.num_layers,
-                    mid_channels=ch * 2 
+                    mid_channels=ch * 2,
+                    d_state=d_state,
+                    dt_rank=dt_rank if dt_rank is not None else d_state,
+                    ssm_expand_ratio=layer_expand_ratio
                 )
                 self.multi_scale_adapters.append(adapter)
             
-            directions = ('h', 'h_flip', 'v', 'v_flip')
-            self.skip_ss2d = SS2D(
-                out_channels,
-                ssm_ratio=ssm_expand_ratio,
-                d_state=d_state,
-                dt_rank=dt_rank if dt_rank is not None else d_state,
-                directions=directions,
-                use_out_proj=False,
-                use_out_norm=True
-            )
 
         if self.use_multi_scale_skip:
             num_skip_sources = 1  # identity
@@ -265,11 +308,7 @@ class SS2DNeck(BaseModule):
                 
                 self.logger.info(f'Initialized MultiScaleAdapter {i} for channel {self.multi_scale_channels[i]} with {adapter.num_layers}-layer MLP')
             
-            if hasattr(self, 'skip_ss2d'):
-                with torch.no_grad():
-                    if hasattr(self.skip_ss2d, 'in_proj'):
-                        self.skip_ss2d.in_proj.weight.data *= 0.1
-                self.logger.info('Initialized shared skip SS2D block for weighted feature processing')
+            self.logger.info('Initialized multi-scale adapters with dedicated SS2D blocks')
     
     def forward(self, x, multi_scale_features=None):
 
@@ -287,17 +326,15 @@ class SS2DNeck(BaseModule):
         outputs = {}
         
         x_proj = self.mlp_proj(identity)  # [B, out_channels, H, W]
-        x_proj = x_proj.permute(0, 2, 3, 1).view(B, H * W, -1)  # [B, H*W, out_channels]
+        x_proj = x_proj.permute(0, 2, 3, 1)  # [B, H, W, out_channels]
         
-        x_proj = x_proj + self.pos_embed  # [B, H*W, out_channels]
-        
-        x_spatial = x_proj.view(B, H, W, -1)  # [B, H, W, out_channels]
+        x_spatial = x_proj + self.pos_embed  # [B, H, W, out_channels] - 4차원으로 바로 더하기
 
         ss2d_output = self.ss2d_fscil(x_spatial)
 
         final_output = ss2d_output
 
-        skip_features_spatial = [identity] if self.use_multi_scale_skip else None  # 공간 정보 유지
+        skip_features_spatial = [] if self.use_multi_scale_skip else None  # layer4 중복 사용 방지
 
         if self.use_multi_scale_skip and skip_features_spatial is not None:
             if multi_scale_features is not None:
@@ -309,19 +346,14 @@ class SS2DNeck(BaseModule):
                         if hasattr(self, 'logger') and torch.rand(1).item() < 0.01:  # 1% 확률로 로그
                             self.logger.info(f"MultiScaleAdapter {i}: {feat.shape} → {adapted_feat.shape}")
 
-        if self.use_multi_scale_skip and skip_features_spatial is not None and len(skip_features_spatial) > 1:
-            # 모든 skip features는 이미 동일한 공간 크기 (MultiScaleAdapter에서 맞춤)
-            B, C, H, W = skip_features_spatial[0].shape  # 기준 크기 (identity)
-            
-            skip_stack = torch.stack(skip_features_spatial, dim=1)  # [B, N, C, H, W]
-            
-            # 공간 차원을 유지하면서 가중치 계산을 위해 평균 풀링
-            skip_flat = skip_stack.mean(dim=(-2, -1))  # [B, N, C] - 공간 정보 압축
+        if self.use_multi_scale_skip and skip_features_spatial is not None and len(skip_features_spatial) > 0:
+            # skip_features_spatial은 이제 각각 SS2D 처리된 벡터들 [B, out_channels]
+            skip_stack = torch.stack(skip_features_spatial, dim=1)  # [B, N, out_channels]
             
             # Prepare Query (from SS2D output), Key, Value (from skip features)
-            query = self.query_proj(ss2d_output).unsqueeze(1)  # [B, 1, C]
-            keys = self.key_proj(skip_flat)         # [B, N, C]
-            values = self.value_proj(skip_flat)     # [B, N, C]
+            query = self.query_proj(ss2d_output).unsqueeze(1)  # [B, 1, out_channels]
+            keys = self.key_proj(skip_stack)         # [B, N, out_channels]
+            values = self.value_proj(skip_stack)     # [B, N, out_channels]
             
             # Multi-head cross-attention
             attended_features, attention_weights = self.cross_attention(query, keys, values)
@@ -330,25 +362,17 @@ class SS2DNeck(BaseModule):
             # softmax 정규화 (안정성 보강)
             weights = torch.softmax(attention_weights.squeeze(1), dim=-1)  # [B, N]
             
-            # Skip features에 가중치 적용 (공간 정보 유지)
-            weighted_skip = (weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * skip_stack).sum(dim=1)  # [B, C, H, W]
+            # Skip features에 가중치 적용
+            weighted_skip_vector = (weights.unsqueeze(-1) * skip_stack).sum(dim=1)  # [B, out_channels]
             
-            # Apply shared SS2D to weighted skip features (공간 정보 활용)
-            weighted_skip_spatial = weighted_skip.permute(0, 2, 3, 1)  # [B, H, W, C]
-            skip_ss2d_output, _ = self.skip_ss2d(weighted_skip_spatial)  # [B, H, W, C]
-            
-            # Convert back to vector format
-            skip_ss2d_output = skip_ss2d_output.permute(0, 3, 1, 2)  # [B, C, H, W]
-            skip_ss2d_output = F.adaptive_avg_pool2d(skip_ss2d_output, (1, 1)).view(B, -1)  # [B, C]
-            
-            # 최종 출력: SS2D + SS2D-processed skip connections
-            final_output = ss2d_output + 0.1 * skip_ss2d_output
+            # 최종 출력: SS2D + Multi-Scale Skip features (각각 SS2D 처리됨)
+            final_output = ss2d_output + 0.1 * weighted_skip_vector
             
             # 디버깅: cross-attention weights 출력
             if hasattr(self, 'logger') and torch.rand(1).item() < 0.01:  # 1% 확률로 로그
                 weight_values = weights[0].detach().cpu().numpy()
                 # Generate dynamic feature names based on actual skip features
-                feature_names = ['layer4']
+                feature_names = []
                 if self.use_multi_scale_skip:
                     feature_names.extend([f'layer{i+1}' for i in range(len(self.multi_scale_channels))])
                 feature_names = feature_names[:len(skip_features_spatial)]
