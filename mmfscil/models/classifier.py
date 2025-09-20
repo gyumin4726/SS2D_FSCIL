@@ -140,24 +140,15 @@ class ImageClassifierCIL(BaseClassifier):
         x = self.extract_feat(img)
         if isinstance(x, dict):
             x_main = x.get('main')
-            x_residual = x.get('residual')
             dts = x.get('dts')
             Bs = x.get('Bs')
             Cs = x.get('Cs')
-            dts_new = x.get('dts_new')
-            Bs_new = x.get('Bs_new')
-            Cs_new = x.get('Cs_new')
-            aux_loss = x.get('aux_loss')  # MoE load balancing loss
             x = x['out']
 
         losses = dict()
         if self.mixup == 0.:
             loss = self.head.forward_train(x, gt_label)
             losses.update(loss)
-            
-        # Add MoE auxiliary loss for load balancing
-        if aux_loss is not None:
-            losses['aux_loss'] = aux_loss
 
         # make sure not mixup feat
         if gt_label_aux is not None:
@@ -170,15 +161,12 @@ class ImageClassifierCIL(BaseClassifier):
         # Calculate norms for different feature sets
         indices_base = gt_label < self.head.base_classes
         indices_novel = gt_label >= self.head.base_classes
-        self.calculate_norms(losses, indices_base, indices_novel, x, x_main,
-                             x_residual, dts, Bs, Cs, dts_new, Bs_new, Cs_new)
+        self.calculate_norms(losses, indices_base, indices_novel, x, x_main, dts, Bs, Cs)
 
         # Losses for feature separation and suppression
         if self.mamba_neck:
             self.calculate_class_sensitive_losses(losses, indices_base,
-                                                  indices_novel, x_main, dts,
-                                                  Bs, Cs, dts_new, Bs_new,
-                                                  Cs_new)
+                                                  indices_novel, x_main, dts, Bs, Cs)
 
         # mixup feat when mixup > 0, this cannot be with augment mixup
         if self.mixup > 0. and self.mixup_prob > 0. and np.random.random() > (
@@ -225,8 +213,7 @@ class ImageClassifierCIL(BaseClassifier):
             similarity_matrix)
         return torch.mean(confusion_matrix)
 
-    def calculate_sep_losses(self, losses, indices_base, indices_novel, dts,
-                             Bs, Cs, dts_new, Bs_new, Cs_new):
+    def calculate_sep_losses(self, losses, indices_base, indices_novel, dts, Bs, Cs):
         """
         Calculates separation losses for ssm branches.
 
@@ -234,7 +221,7 @@ class ImageClassifierCIL(BaseClassifier):
             losses (dict): Losses dictionary to update.
             indices_base (Tensor): Indices for base class examples.
             indices_novel (Tensor): Indices for novel class examples.
-            dts, Bs, Cs, dts_new, Bs_new, Cs_new (Tensor): Feature tensors for calculating separation.
+            dts, Bs, Cs (Tensor): Feature tensors for calculating separation.
         """
         if self.neck.loss_weight_sep > 0:
             for key, value in [('dts', dts), ('Bs', Bs), ('Cs', Cs)]:
@@ -242,17 +229,9 @@ class ImageClassifierCIL(BaseClassifier):
                     losses[
                         f'loss_sep_{key}_base'] = self.neck.loss_weight_sep * self.calculate_sep_loss(
                             value, indices_base, indices_novel)
-        if self.neck.loss_weight_sep_new > 0:
-            for key, value in [('dts_new', dts_new), ('Bs_new', Bs_new),
-                               ('Cs_new', Cs_new)]:
-                if value is not None:
-                    losses[
-                        f'loss_sep_{key}'] = self.neck.loss_weight_sep_new * self.calculate_sep_loss(
-                            value, indices_base, indices_novel)
 
     def calculate_class_sensitive_losses(self, losses, indices_base,
-                                         indices_novel, x_main, dts, Bs, Cs,
-                                         dts_new, Bs_new, Cs_new):
+                                         indices_novel, x_main, dts, Bs, Cs):
         """
         Computes class-sensitive losses for feature suppression and separation.
 
@@ -260,7 +239,7 @@ class ImageClassifierCIL(BaseClassifier):
             losses (dict): Dictionary to store computed losses.
             indices_base (Tensor): Indices for base class examples.
             indices_novel (Tensor): Indices for novel class examples.
-            x_main, dts, Bs, Cs, dts_new, Bs_new, Cs_new (Tensor): Feature tensors for calculating losses.
+            x_main, dts, Bs, Cs (Tensor): Feature tensors for calculating losses.
         """
         num_base = indices_base.sum()
         num_novel = indices_novel.sum()
@@ -275,11 +254,9 @@ class ImageClassifierCIL(BaseClassifier):
                 'loss_supp_novel'] = -self.neck.loss_weight_supp_novel * torch.norm(
                     x_main[indices_novel]) / torch.numel(x_main[indices_novel])
         if num_base > 0 and num_novel > 0:
-            self.calculate_sep_losses(losses, indices_base, indices_novel, dts,
-                                      Bs, Cs, dts_new, Bs_new, Cs_new)
+            self.calculate_sep_losses(losses, indices_base, indices_novel, dts, Bs, Cs)
 
-    def calculate_norms(self, losses, indices_base, indices_novel, x, x_main,
-                        x_residual, dts, Bs, Cs, dts_new, Bs_new, Cs_new):
+    def calculate_norms(self, losses, indices_base, indices_novel, x, x_main, dts, Bs, Cs):
         """
         Calculates the norms of feature tensors.
 
@@ -290,16 +267,13 @@ class ImageClassifierCIL(BaseClassifier):
             feature_tensors (dict): Feature tensors keyed by their type.
         """
         # Base and novel feature norms
-        for key, value in [('input', x), ('main', x_main),
-                           ('residual', x_residual)]:
+        for key, value in [('input', x), ('main', x_main)]:
             if value is not None:
                 losses[f'norm_{key}_base'] = torch.norm(value[indices_base])
                 losses[f'norm_{key}_novel'] = torch.norm(value[indices_novel])
 
         # Input-dependent parameters norms
-        for key, value in [('dts', dts), ('Bs', Bs), ('Cs', Cs),
-                           ('dts_new', dts_new), ('Bs_new', Bs_new),
-                           ('Cs_new', Cs_new)]:
+        for key, value in [('dts', dts), ('Bs', Bs), ('Cs', Cs)]:
             if value is not None:
                 losses[f'norm_{key}_base'] = torch.norm(value[indices_base])
                 losses[f'norm_{key}_novel'] = torch.norm(value[indices_novel])
