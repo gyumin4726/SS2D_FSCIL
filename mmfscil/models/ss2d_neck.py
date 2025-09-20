@@ -84,7 +84,9 @@ class SS2DProcessor(nn.Module):
             use_out_norm=True
         )
 
-        self.norm = nn.LayerNorm(dim)
+        # SS2D 출력 차원은 ssm_expand_ratio에 의해 변경됨
+        expanded_dim = int(dim * ssm_expand_ratio)
+        self.norm = nn.LayerNorm(expanded_dim)
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         
     def forward(self, x):
