@@ -135,3 +135,6 @@ data/
 
 work_dirs
 work_dirs
+
+# VMamba submodule (exclude from tracking)
+VMamba/
