@@ -49,9 +49,9 @@ optimizer = dict(type='SGD',
                  weight_decay=0.0005,
                  paramwise_cfg=dict(
                      custom_keys={
-                         'neck.mlp_proj.': dict(lr_mult=1.2),
-                         'neck.pos_embed': dict(lr_mult=1.2),
-                         'neck.ss2d_fscil.processor': dict(lr_mult=1.2),  # SS2D 프로세서
+                         'neck.mlp_proj.': dict(lr_mult=0.8),
+                         'neck.pos_embed': dict(lr_mult=0.8),
+                         'neck.ss2d_fscil.processor': dict(lr_mult=0.8),  # SS2D 프로세서
                      }))
 
 optimizer_config = dict(grad_clip=None)
