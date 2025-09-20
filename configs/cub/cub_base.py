@@ -19,7 +19,7 @@ model = dict(backbone=dict(type='VMambaBackbone',
                        out_channels=1024,
                        feat_size=7,
                        num_layers=3,
-                       use_multi_scale_skip=True,
+                       use_multi_scale_skip=False,
                        multi_scale_channels=[128, 256, 512],
                        d_state=256,
                        dt_rank=256,
@@ -44,7 +44,7 @@ optimizer = dict(
             'backbone': dict(lr_mult=0.1),
             'neck.mlp_proj.': dict(lr_mult=1.2),
             'neck.pos_embed': dict(lr_mult=1.2),
-            'neck.ss2d_fscil.processor': dict(lr_mult=1.2),  # SS2D 프로세서
+            'neck.ss2d_fscil.processor': dict(lr_mult=5.0),  # SS2D 프로세서
         }
     ))
 
