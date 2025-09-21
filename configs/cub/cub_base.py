@@ -45,6 +45,12 @@ optimizer = dict(
             'neck.mlp_proj.': dict(lr_mult=1.2),
             'neck.pos_embed': dict(lr_mult=1.2),
             'neck.ss2d_fscil.processor': dict(lr_mult=5.0),  # SS2D 프로세서
+            # Multi-Scale Skip Connection 관련
+            'neck.multi_scale_adapters.': dict(lr_mult=1.5),  # MultiScaleAdapter들
+            'neck.cross_attention.': dict(lr_mult=1.0),       # Cross-attention
+            'neck.query_proj.': dict(lr_mult=1.0),            # Query projection
+            'neck.key_proj.': dict(lr_mult=1.0),              # Key projection  
+            'neck.value_proj.': dict(lr_mult=1.0),            # Value projection
         }
     ))
 
